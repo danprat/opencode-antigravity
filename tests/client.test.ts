@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import {
   ANTIGRAVITY_MANAGED_PROJECT_ID,
+  antigravityHeaders,
   isGeneratedProjectId,
   loadCodeAssist,
   resolveProjectId,
@@ -57,5 +58,13 @@ describe("Antigravity project discovery", () => {
       stableProjectId("antigravity-default"),
     );
     expect(projectId).toBe(ANTIGRAVITY_MANAGED_PROJECT_ID);
+  });
+
+  it("uses the observed CLI request fingerprint", () => {
+    const headers = antigravityHeaders("token");
+    expect(headers["User-Agent"]).toContain("antigravity/cli/1.1.23");
+    expect(headers.Accept).toBeUndefined();
+    expect(headers["X-Goog-Api-Client"]).toBeUndefined();
+    expect(headers["Client-Metadata"]).toBeUndefined();
   });
 });

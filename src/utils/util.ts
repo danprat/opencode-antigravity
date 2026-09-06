@@ -30,16 +30,9 @@ export function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-export const ANTIGRAVITY_MODEL_ENUM: Record<string, string> = {
-  "gemini-3.5-flash-extra-low": "MODEL_PLACEHOLDER_M187",
-  "gemini-3.5-flash-low": "MODEL_PLACEHOLDER_M20",
-  "gemini-3-flash-agent": "MODEL_PLACEHOLDER_M132",
-  "gemini-3.1-pro-low": "MODEL_PLACEHOLDER_M36",
-  "gemini-pro-agent": "MODEL_PLACEHOLDER_M16",
-};
-
 import type { LanguageModelV3Prompt } from "@ai-sdk/provider";
 import crypto from "node:crypto";
+import { getModelEnum } from "../models/models.js";
 
 function conversationSeed(sessionId?: string): string {
   const trimmed = sessionId?.trim();
@@ -84,6 +77,9 @@ export function antigravityRequestEnvelope(
     sessionId?: string;
     prompt?: LanguageModelV3Prompt;
     step?: number;
+    lastStepIndex?: number;
+    requestIndex?: number;
+    isNonGemini?: boolean;
   },
 ): { requestId: string; sessionId: string; labels: Record<string, string> } {
   const providedSession = options?.sessionId?.trim();
@@ -99,12 +95,14 @@ export function antigravityRequestEnvelope(
 
   const usageLabel = isClaude ? "true" : "false";
   const labels: Record<string, string> = {
-    last_step_index: String(lastStepIndex),
+    last_step_index: String(options?.lastStepIndex ?? lastStepIndex),
+    request_id: `${trajectoryId}-${options?.requestIndex ?? Math.max(0, step - 1)}`,
     trajectory_id: trajectoryId,
     used_claude: usageLabel,
     used_claude_conservative: usageLabel,
+    used_non_gemini_model: options?.isNonGemini || isClaude ? "true" : "false",
   };
-  const modelEnum = ANTIGRAVITY_MODEL_ENUM[wireModelId];
+  const modelEnum = getModelEnum(wireModelId);
   if (modelEnum) labels.model_enum = modelEnum;
   return {
     requestId: `agent/${agentId}/${Date.now()}/${trajectoryId}/${step}`,

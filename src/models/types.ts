@@ -19,6 +19,7 @@ export type ModelInfoRaw = {
   displayName?: unknown;
   label?: unknown;
   modelName?: unknown;
+  model?: unknown;
   modelProvider?: unknown;
   apiProvider?: unknown;
   supportsThinking?: unknown;

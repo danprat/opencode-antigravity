@@ -195,35 +195,68 @@ export function getFallbackRuntimeModel(runtimeModel: string, effort?: string): 
   return undefined;
 }
 
-export type GeminiThinkingLevel = "MINIMAL" | "LOW" | "MEDIUM" | "HIGH";
-
 export type ThinkingWire = {
   includeThoughts: boolean;
-  thinkingLevel?: GeminiThinkingLevel;
-  thinkingBudget?: number;
+  thinkingBudget: number;
 };
 
-function googleLevel(effort: string | undefined): GeminiThinkingLevel {
-  const eff = effort?.toLowerCase();
-  if (!eff || eff === "high" || eff === "xhigh" || eff === "max") return "HIGH";
-  if (eff === "medium") return "MEDIUM";
-  if (eff === "minimal" || eff === "min" || eff === "off" || eff === "none") return "MINIMAL";
-  return "LOW";
+export const ANTIGRAVITY_MODEL_ENUM: Record<string, string> = {
+  "gemini-3.8-flash": "MODEL_PLACEHOLDER_M318",
+  "gemini-3.8-flash-tiered": "MODEL_PLACEHOLDER_M322",
+  "gemini-3.7-flash": "MODEL_PLACEHOLDER_M298",
+  "gemini-3.7-flash-tiered": "MODEL_PLACEHOLDER_M301",
+  "gemini-3.6-flash": "MODEL_PLACEHOLDER_M71",
+  "gemini-3.6-flash-low": "MODEL_PLACEHOLDER_M73",
+  "gemini-3.6-flash-medium": "MODEL_PLACEHOLDER_M72",
+  "gemini-3.6-flash-high": "MODEL_PLACEHOLDER_M71",
+  "gemini-3.5-flash": "MODEL_PLACEHOLDER_M20",
+  "gemini-3.5-flash-extra-low": "MODEL_PLACEHOLDER_M187",
+  "gemini-3.5-flash-low": "MODEL_PLACEHOLDER_M20",
+  "gemini-3-flash-agent": "MODEL_PLACEHOLDER_M84",
+  "gemini-3.1-pro": "MODEL_PLACEHOLDER_M36",
+  "gemini-3.1-pro-low": "MODEL_PLACEHOLDER_M36",
+  "gemini-pro-agent": "MODEL_PLACEHOLDER_M16",
+  "claude-sonnet-4-6": "MODEL_PLACEHOLDER_M35",
+  "claude-opus-4-6": "MODEL_PLACEHOLDER_M26",
+  "claude-opus-4-6-thinking": "MODEL_PLACEHOLDER_M26",
+  "gpt-oss-120b": "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
+  "gpt-oss-120b-medium": "MODEL_OPENAI_GPT_OSS_120B_MEDIUM",
+};
+
+const modelEnumCache = new Map<string, string>();
+
+export function registerDiscoveredModelEnums(models: Record<string, { model?: unknown }>): void {
+  for (const [wireId, info] of Object.entries(models)) {
+    if (typeof info.model === "string" && info.model) modelEnumCache.set(wireId, info.model);
+  }
+}
+
+export function getModelEnum(wireModelId: string): string | undefined {
+  const direct = modelEnumCache.get(wireModelId) || ANTIGRAVITY_MODEL_ENUM[wireModelId];
+  if (direct) return direct;
+  const routed = getAntigravityRequestModelId(wireModelId, undefined);
+  return modelEnumCache.get(routed) || ANTIGRAVITY_MODEL_ENUM[routed];
 }
 
 export function getThinkingConfig(
   modelId: string,
   effort: string | undefined,
 ): ThinkingWire | undefined {
-  if (
-    modelId === "gemini-3.8-flash" ||
-    modelId === "gemini-3.7-flash" ||
-    modelId === "gemini-3.6-flash"
-  ) {
-    return { includeThoughts: true, thinkingLevel: googleLevel(effort) };
+  const disabled = effort === "off" || effort === "none";
+  const enabled = !disabled;
+  if (modelId.startsWith("claude-")) {
+    return { includeThoughts: enabled, thinkingBudget: enabled ? 1024 : 0 };
   }
-  if (modelId === "gemini-3.5-flash") {
-    if (effort === "off" || effort === "none") return { includeThoughts: false, thinkingBudget: 0 };
+  if (modelId.startsWith("gpt-oss-")) {
+    return { includeThoughts: enabled, thinkingBudget: enabled ? 8192 : 0 };
+  }
+  if (modelId.startsWith("gemini-3.8-flash") || modelId.startsWith("gemini-3.7-flash") || modelId.startsWith("gemini-3.6-flash")) {
+    if (!enabled) return { includeThoughts: false, thinkingBudget: 0 };
+    const normalized = effort?.toLowerCase();
+    return { includeThoughts: true, thinkingBudget: normalized === "medium" ? 4_000 : normalized === "low" || normalized === "minimal" || normalized === "min" ? 1_000 : -1 };
+  }
+  if (modelId.startsWith("gemini-3.5-flash") || modelId === "gemini-3-flash-agent") {
+    if (!enabled) return { includeThoughts: false, thinkingBudget: 0 };
     const thinkingBudget =
       !effort || effort === "high" || effort === "xhigh" || effort === "max"
         ? 10_000
@@ -232,8 +265,8 @@ export function getThinkingConfig(
           : 1_000;
     return { includeThoughts: true, thinkingBudget };
   }
-  if (modelId === "gemini-3.1-pro") {
-    if (effort === "off" || effort === "none") return { includeThoughts: false, thinkingBudget: 0 };
+  if (modelId.startsWith("gemini-3.1-pro") || modelId === "gemini-pro-agent") {
+    if (!enabled) return { includeThoughts: false, thinkingBudget: 0 };
     return {
       includeThoughts: true,
       thinkingBudget:

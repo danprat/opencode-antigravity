@@ -17,6 +17,7 @@ import type {
 import { redactSecrets } from "../utils/security.js";
 import { antigravityFetch } from "../utils/http.js";
 import { buildAntigravityRequestBody } from "./transform.js";
+import { antigravityEnv } from "../utils/util.js";
 
 type PendingToolCall = {
   /** Backend-assigned id, when the backend supplied one. */
@@ -181,11 +182,115 @@ export interface StreamAntigravityOptions {
   headers?: Record<string, string>;
 }
 
-// Bounds how long a single endpoint/model candidate is given to respond with
-// headers before we give up and try the next one. Only guards the connect
-// phase (cleared as soon as a response arrives), so it never cuts off an
-// in-progress stream of a healthy candidate.
-const CONNECT_TIMEOUT_MS = 20_000;
+const STREAM_HEADER_TIMEOUT_DEFAULT_MS = 180_000;
+const STREAM_STALL_TIMEOUT_DEFAULT_MS = 120_000;
+
+function envTimeoutMs(name: string, fallback: number): number {
+  const raw = antigravityEnv(name);
+  if (!raw || !/^\d+$/.test(raw)) return fallback;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : fallback;
+}
+
+export function streamHeaderTimeoutMs(): number {
+  return envTimeoutMs("STREAM_HEADER_TIMEOUT_MS", STREAM_HEADER_TIMEOUT_DEFAULT_MS);
+}
+
+export function streamStallTimeoutMs(): number {
+  return envTimeoutMs("STREAM_STALL_TIMEOUT_MS", STREAM_STALL_TIMEOUT_DEFAULT_MS);
+}
+
+/**
+ * Applies a response-header deadline and a byte-level watchdog to prevent a
+ * warm connection or SSE response from holding an OpenCode request forever.
+ */
+export async function fetchWithHeaderDeadline(
+  url: string,
+  init: RequestInit,
+  callerSignal: AbortSignal | undefined,
+  headerTimeoutMs: number,
+  stallTimeoutMs: number,
+  fetchFn: (input: string, init: RequestInit) => Promise<Response> = antigravityFetch,
+): Promise<Response> {
+  if (headerTimeoutMs <= 0 && stallTimeoutMs <= 0) {
+    return fetchFn(url, { ...init, signal: callerSignal ?? init.signal });
+  }
+
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort(callerSignal?.reason);
+  callerSignal?.addEventListener("abort", forwardAbort, { once: true });
+  if (callerSignal?.aborted) forwardAbort();
+  const cleanup = () => callerSignal?.removeEventListener("abort", forwardAbort);
+  const headerTimer = headerTimeoutMs > 0
+    ? setTimeout(() => controller.abort(new Error(`no response headers within ${headerTimeoutMs}ms`)), headerTimeoutMs)
+    : undefined;
+
+  try {
+    const response = await fetchFn(url, { ...init, signal: controller.signal });
+    if (headerTimer) clearTimeout(headerTimer);
+    if (!response.body || stallTimeoutMs <= 0) {
+      cleanup();
+      return response;
+    }
+
+    const reader = response.body.getReader();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      if (timer) clearTimeout(timer);
+      cleanup();
+    };
+    const reset = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(
+        () => controller.abort(new Error(`stream stalled: no data for ${stallTimeoutMs}ms`)),
+        stallTimeoutMs,
+      );
+    };
+    reset();
+    let guardedController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const guarded = new ReadableStream<Uint8Array>({
+      start(streamController) {
+        guardedController = streamController;
+      },
+      async pull(streamController) {
+        try {
+          const chunk = await reader.read();
+          if (chunk.done) {
+            finish();
+            streamController.close();
+            return;
+          }
+          reset();
+          streamController.enqueue(chunk.value);
+        } catch (error) {
+          finish();
+          streamController.error(error);
+        }
+      },
+      async cancel(reason) {
+        finish();
+        await reader.cancel(reason);
+      },
+    });
+    controller.signal.addEventListener("abort", () => {
+      guardedController?.error(controller.signal.reason);
+      finish();
+      void reader.cancel(controller.signal.reason).catch(() => {});
+    }, { once: true });
+    return new Response(guarded, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  } catch (error) {
+    if (headerTimer) clearTimeout(headerTimer);
+    cleanup();
+    throw error;
+  }
+}
 
 export async function* streamAntigravity(
   modelId: string,
@@ -233,21 +338,14 @@ export async function* streamAntigravity(
       const url = `${base}/v1internal:streamGenerateContent?alt=sse`;
 
       let response: Response;
-      const connectTimeoutController = new AbortController();
-      const connectTimeout = setTimeout(
-        () => connectTimeoutController.abort(new Error("Antigravity connect timed out")),
-        CONNECT_TIMEOUT_MS,
-      );
-      const signal = callOptions.abortSignal
-        ? AbortSignal.any([callOptions.abortSignal, connectTimeoutController.signal])
-        : connectTimeoutController.signal;
       try {
-        response = await antigravityFetch(url, {
-          method: "POST",
-          headers: requestHeaders,
-          body: JSON.stringify(requestBody),
-          signal,
-        });
+        response = await fetchWithHeaderDeadline(
+          url,
+          { method: "POST", headers: requestHeaders, body: JSON.stringify(requestBody) },
+          callOptions.abortSignal,
+          streamHeaderTimeoutMs(),
+          streamStallTimeoutMs(),
+        );
       } catch (err: unknown) {
         if (callOptions.abortSignal?.aborted) {
           yield {
@@ -259,8 +357,6 @@ export async function* streamAntigravity(
         }
         lastError = err instanceof Error ? err : new Error(String(err));
         continue;
-      } finally {
-        clearTimeout(connectTimeout);
       }
 
       if (!response.ok) {

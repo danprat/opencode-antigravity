@@ -5,7 +5,7 @@ import {
   buildAntigravityRequestBody,
   unsupportedSettingWarnings,
 } from "../src/stream/transform.js";
-import { friendlyAntigravityError, streamAntigravity } from "../src/stream/stream.js";
+import { fetchWithHeaderDeadline, friendlyAntigravityError, streamAntigravity } from "../src/stream/stream.js";
 import { GeminiRole } from "../src/types/enums.js";
 
 describe("Antigravity Stream & Transform", () => {
@@ -169,7 +169,7 @@ describe("Antigravity Stream & Transform", () => {
       projectId: "p",
       callOptions: { prompt } as never,
     });
-    expect(high.request.generationConfig?.thinkingConfig?.thinkingLevel).toBe("HIGH");
+    expect(high.request.generationConfig?.thinkingConfig?.thinkingBudget).toBe(-1);
 
     const low = buildAntigravityRequestBody({
       modelId: "gemini-3.8-flash",
@@ -178,7 +178,7 @@ describe("Antigravity Stream & Transform", () => {
       callOptions: { prompt } as never,
       reasoningEffort: "low",
     });
-    expect(low.request.generationConfig?.thinkingConfig?.thinkingLevel).toBe("LOW");
+    expect(low.request.generationConfig?.thinkingConfig?.thinkingBudget).toBe(1_000);
   });
 
   it("inlines $ref chains so no pointer reaches the backend", () => {
@@ -213,7 +213,7 @@ describe("Antigravity Stream & Transform", () => {
   });
 
   it("terminates on recursive schemas and drops unresolvable pointers", () => {
-    const recursive = convertToolsToGemini([
+    const recursiveDecl = convertToolsToGemini([
       {
         type: "function" as const,
         name: "tree",
@@ -229,18 +229,59 @@ describe("Antigravity Stream & Transform", () => {
           properties: { root: { $ref: "#/$defs/Node" } },
         },
       },
-    ])?.[0]?.functionDeclarations?.[0];
-    expect(JSON.stringify(recursive?.parametersJsonSchema)).not.toContain("$ref");
+    ]);
+    expect(recursiveDecl).toBeUndefined();
 
-    const dangling = convertToolsToGemini([
+    const danglingDecl = convertToolsToGemini([
       {
         type: "function" as const,
         name: "d",
         description: "d",
         inputSchema: { type: "object", properties: { x: { $ref: "#/$defs/Missing" } } },
       },
-    ])?.[0]?.functionDeclarations?.[0];
-    expect(JSON.stringify(dangling?.parametersJsonSchema)).not.toContain("$ref");
+    ]);
+    expect(danglingDecl).toBeUndefined();
+  });
+
+  it("resolves nested schema pointers and preserves intact sibling tools", () => {
+    const tools = convertToolsToGemini([
+      {
+        type: "function" as const,
+        name: "valid",
+        description: "valid",
+        inputSchema: {
+          type: "object",
+          $defs: {
+            Target: { type: "string", description: "target" },
+          },
+          properties: {
+            item: { $ref: "#/$defs/Target" },
+          },
+        },
+      },
+      {
+        type: "function" as const,
+        name: "broken",
+        description: "broken",
+        inputSchema: {
+          type: "object",
+          properties: {
+            item: { $ref: "#/missing" },
+          },
+        },
+      },
+    ]);
+
+    expect(tools?.length).toBe(1);
+    const decls = tools?.[0]?.functionDeclarations;
+    expect(decls?.length).toBe(1);
+    expect(decls?.[0]?.name).toBe("valid");
+    expect(decls?.[0]?.parametersJsonSchema).toEqual({
+      type: "object",
+      properties: {
+        item: { type: "string", description: "target" },
+      },
+    });
   });
 
   it("survives malformed tool-call arguments replayed from history", () => {
@@ -282,13 +323,26 @@ describe("Antigravity Stream & Transform", () => {
         } as never,
       }).request.toolConfig?.functionCallingConfig;
 
-    expect(build(undefined)?.mode).toBe("VALIDATED");
-    expect(build({ type: "auto" })?.mode).toBe("VALIDATED");
+    expect(build(undefined)).toBeUndefined();
+    expect(build({ type: "auto" })).toBeUndefined();
     expect(build({ type: "none" })?.mode).toBe("NONE");
     expect(build({ type: "required" })?.mode).toBe("ANY");
     const specific = build({ type: "tool", toolName: "read" });
     expect(specific?.mode).toBe("ANY");
     expect(specific?.allowedFunctionNames).toEqual(["read"]);
+  });
+
+  it("aborts a stream that stops delivering response bytes", async () => {
+    const body = new ReadableStream<Uint8Array>({ start() {} });
+    const response = await fetchWithHeaderDeadline(
+      "https://example.test",
+      {},
+      undefined,
+      100,
+      5,
+      async () => new Response(body),
+    );
+    await expect(response.text()).rejects.toThrow("stream stalled: no data for 5ms");
   });
 
   it("forwards topK and stopSequences and warns about settings it drops", () => {

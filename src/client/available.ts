@@ -1,3 +1,4 @@
+import { registerDiscoveredModelEnums } from "../models/models.js";
 import type { AvailableModelsRaw, ModelInfoRaw } from "../models/types.js";
 import { isRecord } from "../utils/util.js";
 import { antigravityFetch } from "../utils/http.js";
@@ -10,13 +11,6 @@ export type InternalJsonResult = {
   status: number;
   data: unknown;
 };
-
-function jsonHeaders(token: string): Record<string, string> {
-  return {
-    ...antigravityHeaders(token),
-    Accept: "application/json",
-  };
-}
 
 export async function postInternalJson(
   path: string,
@@ -31,7 +25,7 @@ export async function postInternalJson(
     try {
       const res = await antigravityFetch(`${endpoint}${path}`, {
         method: "POST",
-        headers: jsonHeaders(token),
+        headers: antigravityHeaders(token),
         body: JSON.stringify(body),
         signal: combined,
       });
@@ -76,6 +70,7 @@ export function mergeAvailableModelsResults(
     if (!result) continue;
     const map = extractModelsMap(result.data);
     Object.assign(merged, map);
+    registerDiscoveredModelEnums(map);
     if (isRecord(result.data)) {
       if (result.data.defaultAgentModelId !== undefined) {
         defaultAgentModelId = result.data.defaultAgentModelId;
@@ -99,7 +94,7 @@ async function fetchAvailableModelsFromEndpoint(
     const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
     const res = await antigravityFetch(`${endpoint}/v1internal:fetchAvailableModels`, {
       method: "POST",
-      headers: jsonHeaders(token),
+      headers: antigravityHeaders(token),
       body: JSON.stringify({ project: projectId }),
       signal: combined,
     });

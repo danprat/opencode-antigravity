@@ -115,83 +115,254 @@ function parseImageData(raw: string | Uint8Array, explicitMime?: string): { data
   return undefined;
 }
 
-/**
- * Gemini has no notion of `$ref`, so a schema that reaches the backend with one
- * still in it is rejected outright. Recursive schemas cannot be expressed at
- * all, so a self-referential definition degrades to an untyped stub.
- */
-function cycleStub(target: unknown): Record<string, unknown> {
-  const type = isRecord(target) && typeof target.type === "string" ? target.type : "object";
-  const description = isRecord(target) ? asString(target.description) : undefined;
-  return { type, ...(description ? { description } : {}) };
+type SchemaReferenceIssue = {
+  path: string;
+  ref: string;
+  reason: string;
+};
+
+type DereferencedSchema = {
+  schema: unknown;
+  issues: SchemaReferenceIssue[];
+};
+
+type DereferenceState = {
+  nodes: number;
+};
+
+const MAX_SCHEMA_DEREFERENCE_DEPTH = 64;
+const MAX_SCHEMA_DEREFERENCE_NODES = 10_000;
+const SCHEMA_MAP_KEYWORDS = new Set([
+  "properties",
+  "patternProperties",
+  "dependentSchemas",
+  "dependencies",
+]);
+const SCHEMA_VALUE_KEYWORDS = new Set([
+  "additionalItems",
+  "additionalProperties",
+  "contains",
+  "contentSchema",
+  "else",
+  "if",
+  "items",
+  "not",
+  "propertyNames",
+  "then",
+  "unevaluatedItems",
+  "unevaluatedProperties",
+]);
+const SCHEMA_ARRAY_KEYWORDS = new Set(["allOf", "anyOf", "oneOf", "prefixItems"]);
+
+/** Resolve a local RFC 6901 JSON Pointer against the original tool schema. */
+function resolveLocalJsonPointer(ref: string, rootSchema: unknown): unknown {
+  if (ref === "#") return rootSchema;
+  if (!ref.startsWith("#/")) return undefined;
+
+  let current: unknown = rootSchema;
+  for (const token of ref.slice(2).split("/")) {
+    const key = token.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (Array.isArray(current)) {
+      if (!/^(0|[1-9]\d*)$/.test(key)) return undefined;
+      const index = Number(key);
+      if (!Number.isSafeInteger(index) || index >= current.length) return undefined;
+      current = current[index];
+      continue;
+    }
+    if (!current || typeof current !== "object") return undefined;
+    if (!Object.prototype.hasOwnProperty.call(current, key)) return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
+}
+
+function dereferenceSchemaMap(
+  schemaMap: unknown,
+  rootSchema: unknown,
+  refStack: Set<string>,
+  objectStack: Set<object>,
+  state: DereferenceState,
+  path: string,
+  depth: number,
+): DereferencedSchema {
+  if (!isRecord(schemaMap)) {
+    return dereferenceSchema(schemaMap, rootSchema, refStack, objectStack, state, path, depth);
+  }
+
+  const out: Record<string, unknown> = {};
+  const issues: SchemaReferenceIssue[] = [];
+  for (const [key, value] of Object.entries(schemaMap)) {
+    const result = dereferenceSchema(
+      value,
+      rootSchema,
+      refStack,
+      objectStack,
+      state,
+      `${path}.${key}`,
+      depth,
+    );
+    out[key] = result.schema;
+    issues.push(...result.issues);
+  }
+  return { schema: out, issues };
 }
 
 /**
- * Inline every `$ref` against the definitions in scope.
- *
- * `active` holds only the definitions currently being expanded and entries are
- * removed on the way back out. Marking nodes as seen for the whole traversal
- * instead would leave the second and later uses of a definition un-expanded:
- * `$defs` is walked before `properties`, so every definition would already be
- * marked by the time the refs pointing at it were resolved, and any nested
- * `$ref` inside them would ship as-is.
+ * Inline reachable local references while bounding expansion of schemas.
+ * A reported issue causes only the affected tool declaration to be omitted.
  */
 function dereferenceSchema(
   schema: unknown,
-  rootDefs: Record<string, unknown> = {},
-  active = new Set<unknown>(),
-): unknown {
-  if (!schema || typeof schema !== "object") return schema;
+  rootSchema: unknown = schema,
+  refStack = new Set<string>(),
+  objectStack = new Set<object>(),
+  state: DereferenceState = { nodes: 0 },
+  path = "$",
+  depth = 0,
+): DereferencedSchema {
+  if (depth > MAX_SCHEMA_DEREFERENCE_DEPTH) {
+    return {
+      schema: {},
+      issues: [
+        {
+          path,
+          ref: "(depth limit)",
+          reason: `schema expansion exceeded ${MAX_SCHEMA_DEREFERENCE_DEPTH} levels`,
+        },
+      ],
+    };
+  }
+  state.nodes += 1;
+  if (state.nodes > MAX_SCHEMA_DEREFERENCE_NODES) {
+    return {
+      schema: {},
+      issues: [
+        {
+          path,
+          ref: "(node limit)",
+          reason: `schema expansion exceeded ${MAX_SCHEMA_DEREFERENCE_NODES} nodes`,
+        },
+      ],
+    };
+  }
+  if (!schema || typeof schema !== "object") return { schema, issues: [] };
+
   if (Array.isArray(schema)) {
-    return schema.map((item) => dereferenceSchema(item, rootDefs, active));
+    const results = schema.map((item, index) =>
+      dereferenceSchema(
+        item,
+        rootSchema,
+        refStack,
+        objectStack,
+        state,
+        `${path}[${index}]`,
+        depth + 1,
+      ),
+    );
+    return {
+      schema: results.map((result) => result.schema),
+      issues: results.flatMap((result) => result.issues),
+    };
   }
 
   const s = schema as Record<string, unknown>;
+  if (objectStack.has(s)) {
+    return {
+      schema: {},
+      issues: [{ path, ref: "(object cycle)", reason: "circular schema object" }],
+    };
+  }
 
-  const defs: Record<string, unknown> = { ...rootDefs };
-  if (isRecord(s.$defs)) Object.assign(defs, s.$defs);
-  if (isRecord(s.definitions)) Object.assign(defs, s.definitions);
+  const nextObjectStack = new Set(objectStack);
+  nextObjectStack.add(s);
 
   if (typeof s.$ref === "string") {
-    const match = s.$ref.match(/^#\/(?:\$defs|definitions)\/(.+)$/);
-    const target = match?.[1] ? defs[match[1]] : undefined;
-    if (target !== undefined) {
-      // Already being expanded further up the stack: the definition refers back
-      // to itself, which has no Gemini equivalent.
-      if (active.has(target)) return cycleStub(target);
-      // The recursive call marks `target` active for its own subtree, so it
-      // must not be marked here as well — that would read as a self-reference.
-      const resolved = dereferenceSchema(target, defs, active);
-      if (!isRecord(resolved)) return resolved;
-      // Keys sitting alongside the `$ref` (description, etc.) win over the target's.
-      const { $ref: _ref, ...rest } = s;
-      const restCleaned = dereferenceSchema(rest, defs, active);
-      return isRecord(restCleaned) ? { ...resolved, ...restCleaned } : resolved;
+    const ref = s.$ref;
+    if (refStack.has(ref)) {
+      return {
+        schema: {},
+        issues: [{ path, ref, reason: "circular local reference" }],
+      };
     }
 
-    // Pointer we cannot resolve — an external ref, or a definition that never
-    // made it into scope. Drop it: a `$ref` the backend rejects is worse than
-    // an under-specified argument.
-    const { $ref: _unresolved, ...rest } = s;
-    const restCleaned = dereferenceSchema(rest, defs, active);
-    const kept = isRecord(restCleaned) ? restCleaned : {};
-    return kept.type ? kept : { ...kept, type: "object" };
+    const target = resolveLocalJsonPointer(ref, rootSchema);
+    if (target === undefined) {
+      return {
+        schema: {},
+        issues: [{ path, ref, reason: "target is not present in the root schema" }],
+      };
+    }
+
+    const nextRefStack = new Set(refStack);
+    nextRefStack.add(ref);
+    const resolved = dereferenceSchema(
+      target,
+      rootSchema,
+      nextRefStack,
+      nextObjectStack,
+      state,
+      path,
+      depth + 1,
+    );
+    const { $ref: _, ...siblings } = s;
+    const siblingResult = dereferenceSchema(
+      siblings,
+      rootSchema,
+      refStack,
+      nextObjectStack,
+      state,
+      path,
+      depth + 1,
+    );
+
+    if (isRecord(resolved.schema) && isRecord(siblingResult.schema)) {
+      return {
+        schema: { ...resolved.schema, ...siblingResult.schema },
+        issues: [...resolved.issues, ...siblingResult.issues],
+      };
+    }
+    return {
+      schema: resolved.schema,
+      issues: [...resolved.issues, ...siblingResult.issues],
+    };
   }
 
-  if (active.has(s)) return cycleStub(s);
-  active.add(s);
-  try {
-    const out: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(s)) {
-      // Definition blocks are inlined at their use sites and stripped later;
-      // walking them here only risks emitting stubs for unused definitions.
-      if (key === "$defs" || key === "definitions") continue;
-      out[key] = dereferenceSchema(value, defs, active);
+  const out: Record<string, unknown> = {};
+  const issues: SchemaReferenceIssue[] = [];
+  for (const [key, value] of Object.entries(s)) {
+    if (key === "$defs" || key === "definitions") continue;
+
+    let result: DereferencedSchema | undefined;
+    if (SCHEMA_MAP_KEYWORDS.has(key)) {
+      result = dereferenceSchemaMap(
+        value,
+        rootSchema,
+        refStack,
+        nextObjectStack,
+        state,
+        `${path}.${key}`,
+        depth + 1,
+      );
+    } else if (SCHEMA_VALUE_KEYWORDS.has(key) || SCHEMA_ARRAY_KEYWORDS.has(key)) {
+      result = dereferenceSchema(
+        value,
+        rootSchema,
+        refStack,
+        nextObjectStack,
+        state,
+        `${path}.${key}`,
+        depth + 1,
+      );
     }
-    return out;
-  } finally {
-    active.delete(s);
+
+    if (result) {
+      out[key] = result.schema;
+      issues.push(...result.issues);
+    } else {
+      out[key] = value;
+    }
   }
+  return { schema: out, issues };
 }
 
 function ensureRootObjectSchema(schema: unknown): Record<string, unknown> {
@@ -204,21 +375,38 @@ function ensureRootObjectSchema(schema: unknown): Record<string, unknown> {
   return schema;
 }
 
+const META_SCHEMA_KEYWORDS = new Set([
+  "$schema",
+  "$id",
+  "$anchor",
+  "$dynamicAnchor",
+  "$vocabulary",
+  "$comment",
+  "$defs",
+  "definitions",
+]);
+
+function stripMetaSchemaMap(schemaMap: unknown): unknown {
+  if (!isRecord(schemaMap)) return stripMetaSchema(schemaMap);
+  return Object.fromEntries(
+    Object.entries(schemaMap).map(([key, value]) => [key, stripMetaSchema(value)]),
+  );
+}
+
 function stripMetaSchema(schema: unknown): unknown {
-  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return schema;
-  const omit = new Set([
-    "$schema",
-    "$id",
-    "$anchor",
-    "$dynamicAnchor",
-    "$vocabulary",
-    "$comment",
-    "$defs",
-    "definitions",
-  ]);
+  if (!schema || typeof schema !== "object") return schema;
+  if (Array.isArray(schema)) return schema.map(stripMetaSchema);
+
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(schema)) {
-    if (!omit.has(key)) out[key] = stripMetaSchema(value);
+    if (META_SCHEMA_KEYWORDS.has(key)) continue;
+    if (SCHEMA_MAP_KEYWORDS.has(key)) {
+      out[key] = stripMetaSchemaMap(value);
+    } else if (SCHEMA_VALUE_KEYWORDS.has(key) || SCHEMA_ARRAY_KEYWORDS.has(key)) {
+      out[key] = stripMetaSchema(value);
+    } else {
+      out[key] = value;
+    }
   }
   return out;
 }
@@ -446,7 +634,7 @@ export function convertPromptToContents(
 const jsonSchemaCache = new WeakMap<object, Record<string, unknown>>();
 const legacySchemaCache = new WeakMap<object, Record<string, unknown>>();
 
-function processToolSchema(inputSchema: unknown, useLegacyParameters: boolean): Record<string, unknown> {
+function processToolSchema(inputSchema: unknown, useLegacyParameters: boolean): Record<string, unknown> | undefined {
   const cache = useLegacyParameters ? legacySchemaCache : jsonSchemaCache;
   const cacheable = isRecord(inputSchema);
   if (cacheable) {
@@ -455,7 +643,11 @@ function processToolSchema(inputSchema: unknown, useLegacyParameters: boolean): 
   }
 
   const dereferenced = dereferenceSchema(inputSchema);
-  const rootObject = ensureRootObjectSchema(dereferenced);
+  if (dereferenced.issues.length > 0) {
+    return undefined;
+  }
+
+  const rootObject = ensureRootObjectSchema(dereferenced.schema);
   const stripped = stripMetaSchema(rootObject);
   const schema = (
     useLegacyParameters ? normalizeCustomToolSchema(stripped) : stripped
@@ -475,6 +667,7 @@ export function convertToolsToGemini(
   for (const tool of tools) {
     if (tool.type !== "function") continue;
     const schema = processToolSchema(tool.inputSchema, useLegacyParameters);
+    if (!schema) continue;
 
     functionDeclarations.push({
       name: tool.name,
@@ -489,12 +682,12 @@ export function convertToolsToGemini(
 }
 
 /**
- * `VALIDATED` (rather than `AUTO`) is the default the backend is tuned for: it
- * checks generated arguments against the declared schema before returning them.
+ * The CLI omits toolConfig for implicit auto tool choice. Only explicit choices
+ * require a function-calling mode on the wire.
  */
 function toolConfigFor(
   toolChoice: LanguageModelV3CallOptions["toolChoice"],
-): NonNullable<GeminiRequestBody["toolConfig"]> {
+): NonNullable<GeminiRequestBody["toolConfig"]> | undefined {
   switch (toolChoice?.type) {
     case "none":
       return { functionCallingConfig: { mode: GeminiToolCallingMode.None } };
@@ -508,7 +701,7 @@ function toolConfigFor(
         },
       };
     default:
-      return { functionCallingConfig: { mode: GeminiToolCallingMode.Validated } };
+      return undefined;
   }
 }
 
@@ -570,14 +763,11 @@ export function buildAntigravityRequestBody(opts: {
       : {}),
   };
 
-  const thinkingWire = getThinkingConfig(modelId, reasoningEffort);
+  const thinkingWire = getThinkingConfig(runtimeModel, reasoningEffort);
   if (thinkingWire) {
     generationConfig.thinkingConfig = {
       includeThoughts: thinkingWire.includeThoughts,
-      ...(thinkingWire.thinkingLevel ? { thinkingLevel: thinkingWire.thinkingLevel } : {}),
-      ...(thinkingWire.thinkingBudget !== undefined
-        ? { thinkingBudget: thinkingWire.thinkingBudget }
-        : {}),
+      thinkingBudget: thinkingWire.thinkingBudget,
     };
   }
 
@@ -596,14 +786,21 @@ export function buildAntigravityRequestBody(opts: {
   const geminiTools = convertToolsToGemini(callOptions.tools, useLegacy);
   if (geminiTools) {
     request.tools = geminiTools;
-    request.toolConfig = toolConfigFor(callOptions.toolChoice);
-  } else if (isClaude) {
-    request.toolConfig = toolConfigFor(callOptions.toolChoice);
+  }
+  const toolConfig = toolConfigFor(callOptions.toolChoice);
+  if (toolConfig) {
+    request.toolConfig = toolConfig;
   }
 
   const envelope = antigravityRequestEnvelope(runtimeModel, isClaude, {
     sessionId,
     prompt: callOptions.prompt,
+    step: Math.max(1, contents.length),
+    lastStepIndex: Math.max(0, contents.length - 1),
+    requestIndex: callOptions.prompt.filter(
+      (message) => message.role === "assistant",
+    ).length,
+    isNonGemini: isClaude || isGptOss,
   });
   request.sessionId = envelope.sessionId;
   request.labels = envelope.labels;
