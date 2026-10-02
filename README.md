@@ -1,7 +1,7 @@
 # opencode-antigravity
 
-[![npm version](https://img.shields.io/npm/v/@rahularya01/opencode-antigravity?logo=npm)](https://www.npmjs.com/package/@rahularya01/opencode-antigravity)
-[![license](https://img.shields.io/npm/l/@rahularya01/opencode-antigravity)](LICENSE)
+[![npm version](https://img.shields.io/npm/v/@danprat/opencode-antigravity?logo=npm)](https://www.npmjs.com/package/@danprat/opencode-antigravity)
+[![license](https://img.shields.io/npm/l/@danprat/opencode-antigravity)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?logo=github)](https://github.com/sponsors/Rahularya01)
 
 **opencode-antigravity** is an [OpenCode](https://opencode.ai) plugin that lets OpenCode talk directly to Google Antigravity / Cloud Code Assist models — Gemini, plus the Claude and GPT-OSS models Antigravity also advertises. Sign in with Google, pick a model, and go. Under the hood it handles OAuth login, native SSE streaming, model routing, and quota diagnostics itself, so it never shells out to an external Antigravity CLI.
@@ -30,12 +30,53 @@ Using [Pi Coding Agent](https://pi.dev) instead of OpenCode? Install the compani
 
 ## Install
 
+> Fork note: this repo (`@danprat/opencode-antigravity`) adds an OpenCode 2.0
+> entrypoint on top of upstream
+> [`@rahularya01/opencode-antigravity`](https://github.com/Rahularya01/opencode-antigravity).
+> OpenCode 1.x instructions below are unchanged.
+
+### OpenCode 2.0
+
+Add the 2.0 entrypoint to your OpenCode config (`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["@danprat/opencode-antigravity/plugin/opencode2"]
+}
+```
+
+OpenCode downloads the package from npm at startup and registers the
+`antigravity` provider in memory (nothing is written into `opencode.json`).
+Then run `/connect`, choose **Antigravity**, and sign in with Google.
+
+Do not load the 1.x and 2.0 entries in the same host. If the model picker
+looks empty, filter by provider **Antigravity** (synced models sort last).
+
+To load a local checkout after `bun run build`, point a plugin directory at
+the built file (OpenCode 2.0 requires a directory, not a bare `.js` path):
+
+```bash
+mkdir -p "$OPENCODE_CONFIG_DIR/plugins/antigravity"
+cat > "$OPENCODE_CONFIG_DIR/plugins/antigravity/package.json" <<'EOF'
+{ "name": "antigravity-local", "type": "module", "main": "./index.js" }
+EOF
+cat > "$OPENCODE_CONFIG_DIR/plugins/antigravity/index.js" <<'EOF'
+export { default } from "/absolute/path/to/opencode-antigravity/dist/plugin-opencode2.js";
+EOF
+```
+
+For local AI SDK fallback testing only, set `ANTIGRAVITY_OPENCODE2_DEV_ENTRY`
+to the built `dist/sdk.js` before starting the service. Unset in production.
+
+### OpenCode 1.x
+
 Add the plugin to your global OpenCode config (`~/.config/opencode/opencode.json`):
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@rahularya01/opencode-antigravity"]
+  "plugin": ["@danprat/opencode-antigravity"]
 }
 ```
 
@@ -44,9 +85,9 @@ Or add the same `plugin` entry to a project's `opencode.json`. OpenCode download
 Optional global install:
 
 ```bash
-npm install -g --ignore-scripts @rahularya01/opencode-antigravity
+npm install -g --ignore-scripts @danprat/opencode-antigravity
 # or
-bun add -g --ignore-scripts @rahularya01/opencode-antigravity
+bun add -g --ignore-scripts @danprat/opencode-antigravity
 ```
 
 To load a local checkout after `bun run build`:

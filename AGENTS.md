@@ -16,6 +16,8 @@ No lint/formatter. Tests import from `src/` (not `dist/`) and mock `globalThis.f
 ## Layout
 
 - `src/entries/plugin.ts` — OpenCode v1 plugin (`id` + `server`). Package exports `.`, `./plugin`, `./server`.
+- `src/entries/plugin-opencode2.ts` — OpenCode 2.0 plugin (`id` + `setup`, dual-exports V1 `server`). Package exports `./plugin/opencode2`, `./server`.
+- `src/opencode2/` — 2.0-only wiring: `catalog.ts` (in-memory provider inventory), `integration.ts` (`/connect` OAuth/API-key/env), `tools.ts`, `commands.ts`, `types.ts` (duck-typed host boundary, no host SDK import).
 - `src/entries/sdk.ts` — `createAntigravity` AI SDK factory. Export `./sdk`.
 - `src/entries/tui.ts` — required no-op TUI stub. Do not put logic here.
 - `src/entries/*.d.ts` — **hand-written** public types; `scripts/build.ts` copies them. `tsc` is `noEmit`. Update these when the public API changes.
