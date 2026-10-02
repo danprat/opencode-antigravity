@@ -46,12 +46,13 @@ const EMPTY_INPUT_SCHEMA = {
 
 /**
  * The three Antigravity tools, adapted to the OpenCode 2.0 tool surface:
- * JSON-Schema `input`, plain-value results.
+ * JSON-Schema `input`, `{ output, content }` results.
  *
  * `generate_image` saves the file (same `.opencode/generated-images/`
  * default as V1) and returns the saved paths as text. Unlike V1 it does not
- * attach image parts to the tool result — the 2.0 tool result is a plain
- * value, so the model reads the file back from disk when it needs pixels.
+ * attach image parts to the tool result — the 2.0 model output is projected
+ * from `content`, so the model reads the file back from disk when it needs
+ * pixels.
  */
 export function createAntigravityToolDefinitions(deps: AntigravityToolDeps): ToolDefinition[] {
   return [
@@ -60,6 +61,7 @@ export function createAntigravityToolDefinitions(deps: AntigravityToolDeps): Too
       description:
         "Generate an image via Antigravity using the signed-in Google account. Saves under .opencode/generated-images/ unless path is set.",
       input: IMAGE_INPUT_SCHEMA,
+      output: { type: "string" },
       execute: async (
         input: {
           prompt: string;
@@ -81,7 +83,12 @@ export function createAntigravityToolDefinitions(deps: AntigravityToolDeps): Too
           signal: context?.signal ?? context?.abort,
         });
         const notes = result.text.join(" ").trim();
-        return `Saved image to ${result.savedPaths.join(", ")}${notes ? `. ${notes}` : ""}`;
+        const output = `Saved image to ${result.savedPaths.join(", ")}${notes ? `. ${notes}` : ""}`;
+        return {
+          output,
+          content: output,
+          metadata: { model: result.model, savedPaths: result.savedPaths },
+        };
       },
     },
     {
@@ -89,10 +96,12 @@ export function createAntigravityToolDefinitions(deps: AntigravityToolDeps): Too
       description:
         "Show Antigravity / Cloud Code Assist shared quota pools and reset times for the signed-in Google account.",
       input: EMPTY_INPUT_SCHEMA,
+      output: { type: "string" },
       execute: async () => {
         try {
           const token = await requireToken(deps);
-          return formatUsageSummary(await fetchAccountUsage(token));
+          const output = formatUsageSummary(await fetchAccountUsage(token));
+          return { output, content: output };
         } catch (error) {
           throw new Error(safeError(error));
         }
@@ -103,10 +112,12 @@ export function createAntigravityToolDefinitions(deps: AntigravityToolDeps): Too
       description:
         "List Antigravity runtime models with remaining shared-pool quota. Set all=true to include tab/chat models.",
       input: MODELS_INPUT_SCHEMA,
+      output: { type: "string" },
       execute: async (input: { all?: boolean }) => {
         try {
           const token = await requireToken(deps);
-          return formatModelsList(await fetchAccountUsage(token), { all: input.all === true });
+          const output = formatModelsList(await fetchAccountUsage(token), { all: input.all === true });
+          return { output, content: output };
         } catch (error) {
           throw new Error(safeError(error));
         }
